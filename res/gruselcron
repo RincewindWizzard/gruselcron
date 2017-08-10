@@ -1,0 +1,184 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+# Diese Programm startet automatisch die Videos
+# Das Format für die Dateinamen ist wie folgt:
+# .*_(?P<minutes>\d\d)(?P<seconds>\d\d)\....$
+# Bitte keine 
+# Beispiel:
+# Dieses Video würde immer um 2 Minuten und 45 Sekunden nach Taktungsbeginn gestartet werden.
+# gront_auftrag_0245.avi
+
+import re, os
+from time import sleep
+import shlex, subprocess
+import logging
+import argparse
+import sys
+import signal
+
+
+def sigterm_handler(_signo, _stack_frame):
+	# Raises SystemExit(0):
+	sys.exit(0)
+
+
+signal.signal(signal.SIGTERM, sigterm_handler)
+
+
+logfile = '/var/log/gruselcron.log'
+datefmt = '%H:%M:%S'
+
+
+# Der Ordner, indem nach Videos gesucht wird
+vidpath = "/mnt/"
+# Wie viele sekunden lang, bis wieder von vorne begonnen werden soll
+taktung = 10 * 60
+name_pattern = re.compile(r'.*(?P<minutes>\d\d)(?P<seconds>\d\d)\....$')
+
+# video player der benutzt werden soll
+video_player = "omxplayer -o local --no-osd"
+
+# das aktuell abgespielte Video
+player_process = None
+
+time_fail_puffer = 3
+def uptime():
+	""" Wie lange war das Pi schon an? """
+	with open('/proc/uptime', 'r') as f:
+		up = f.read()	
+	return float(up.split()[0]) + time_fail_puffer
+
+def showtime():
+	""" Gibt die aktuelle Taktungszeit zurück """
+	return uptime() % taktung
+
+def next_playback(videos):
+	""" Wartet bis das nächste Video abgespielt werden soll """
+	for vid in videos:
+		delta = vid.time - showtime()
+		if delta > 0:
+			logging.debug("[%d] Sleeping %d until %0.2f" % (showtime(), delta, vid.time))
+			sleep(delta)
+			yield vid
+		else:
+			logging.debug("[%d] Skipping %d because %0.2f" % (showtime(), delta, vid.time))
+
+last_video = None
+def play_video(video):
+	""" Stoppt das letzte Video, wenn es noch nicht zuende ist und startet das neue """
+	global player_process, last_video
+	if last_video == video and player_process:
+			restart_video()
+	else:
+		if player_process:
+			logging.debug("[%d] Stopping playback process %d " % (video.time, player_process.pid))
+			subprocess.call(["kill", str(player_process.pid)])
+			player_process.kill()
+			player_process.terminate()
+			player_process.wait()
+
+		# definitiv zum stoppen bringen
+		subprocess.call(["killall", "/usr/bin/omxplayer.bin"])
+
+		player_process = subprocess.Popen(shlex.split(video_player) + [video.path], stdin=subprocess.PIPE)
+		logging.debug("[%d] Start playback for %s " % (video.time, video.path))
+	last_video = video
+
+def restart_video():
+	""" Springt an den Anfang des aktuellen videos """
+	for i in xrange(600 / taktung):
+		player_process.stdin.write('\x1b\x5b\x42') # seeks -600
+	logging.debug("[%d] Start playback for %s " % (last_video.time, last_video.path))
+
+class Video(object):
+	def __init__(self, path):
+		self.path = path
+		m = name_pattern.match(path)
+		self.time = int(m.group("minutes")) * 60 +  int(m.group("seconds"))
+
+	@staticmethod
+	def is_video(path):
+		return os.path.isfile(path) and not name_pattern.match(path) == None
+
+	def __repr__(self):
+		return "%s, %d" % (self.path, self.time)
+
+def read_taktung():
+	# Taktung aus Konfigurationsdatei einlesen
+	global taktung
+
+	try:
+		taktung_conf = os.path.join(vidpath, "taktung.txt")
+		if os.path.isfile(taktung_conf):
+			with open(taktung_conf) as f:
+				for line in f.readlines():
+					if not line[0] == '#':
+						taktung = int(line) * 60
+						logging.debug("Read takt from conf.")
+	except Exception as e:
+		logging.exception(str(e))
+	logging.debug("Repeating every %d minutes." % (taktung))
+
+def main():
+	if os.access(logfile, os.W_OK):
+		logging.basicConfig(format='[%(asctime)s] %(levelname)s: %(message)s', filename=logfile, level=logging.DEBUG, datefmt=datefmt)
+	else:
+		logging.basicConfig(format='[%(asctime)s] %(levelname)s: %(message)s', level=logging.DEBUG, datefmt=datefmt)
+		logging.exception('Unable to create logfile %s' % logfile)
+	logging.debug("Starting at %0.2f" % (showtime()))
+
+	read_taktung()
+
+
+	logging.debug("Searching for videos in %s" % vidpath)
+	videos = [Video(vidpath + f) for f in os.listdir(vidpath) if Video.is_video(vidpath + f)]
+	out_of_bounds = filter(lambda vid: not vid.time < taktung, videos)
+	videos = filter(lambda vid: vid.time < taktung, videos)
+	videos.sort(key=lambda x: x.time)
+
+	for vid in videos:
+		logging.debug("Found %s starting at %d" % (vid.path, vid.time))
+
+	for vid in out_of_bounds:
+		logging.warning("Found %s starting at %d, which is out of bounds [0:%d]" % (vid.path, vid.time, taktung))
+
+	if len(videos) == 0:
+		logging.warning("No videos were found")
+		exit(0)
+
+	while True:
+		try:
+			for vid in next_playback(videos):
+				play_video(vid)
+
+			delta = taktung - showtime()
+			if delta > 0:
+				logging.debug("[%d] Sleeping %d until %d" % (showtime(), delta, taktung))
+				sleep(delta)
+		except Exception as e:
+			logging.exception(repr(e))
+
+if __name__ == '__main__':
+	try:
+		parser = argparse.ArgumentParser()
+		parser.add_argument("--player", help="Choose a player to use with the videos")
+		parser.add_argument("--videos", help="The path where the videos are stored")
+		args = parser.parse_args()
+		video_player = args.player if args.player else video_player
+		vidpath = args.videos if args.videos else vidpath
+
+		if sys.argv[0].find("gruselcron") > -1:
+			sys.stdout.close()
+			sys.stderr.close()
+			sys.stdout = open("/var/log/gruselcron.stdouterr", "w")
+			sys.stderr = sys.stdout
+			main()
+		elif sys.argv[0].find("showtime") > -1:
+			read_taktung()
+			t = showtime()
+			print "%d = %02d:%02d" % (t, t/60, t % 60)
+	except Exception as e:
+		logging.exception(str(e))
+	
+	
+

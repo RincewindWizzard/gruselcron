@@ -1,0 +1,9 @@
+#!/bin/bash
+# BENOETIGT ROOT RECHTE!
+# Dieses Skript setzt die aktuelle Systemzeit, so dass der Bootzeitpunkt 00:00:00 Uhr entspricht
+# auslesen, wie lange schon am laufen
+up=`cat /proc/uptime | sed 's/\..* .*$//g'`
+
+# Zeit setzen
+date -s "00:00:00" && date -s "$up seconds"
+

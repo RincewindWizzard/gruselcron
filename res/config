@@ -1,0 +1,13 @@
+Host server
+ HostName 0xdf.de
+ Port 2222
+ User git
+ IdentityFile ~/.ssh/id_rsa
+ Compression yes
+
+Host gruselcc
+ HostName 6ngxr2uabq3i4ilu.onion
+ Port 22
+ User pi
+ IdentityFile ~/.ssh/id_rsa
+ Compression yes
